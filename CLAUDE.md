@@ -17,8 +17,15 @@ Portfolio project; methodology must be defensible, so every change to the grade 
   `d_yac`), `recompute_adj` (weights per adjustment), `qb_table` (per-QB aggregation), `add_grade`, `shrink`.
 - `backtest.py`: split-half (odd vs even weeks) and year-over-year tests, `bootstrap_diff`, `shrinkage_k`.
 - `mixed.py`: ridge-as-random-effects model (QB + defense + offense). Kept for reference; did not help.
+- `update_board.py`: weekly live-board refresh (no backtests). Fits the value models and shrinkage k from
+  2022-2025, applies them to the current season, writes `boards/<season>_wk<N>.parquet` (one per week,
+  season-to-date, for grade-trend charts) and `boards/<season>_interceptions.parquet` (play-level, for QB
+  pages). `boards/` is committed; `data/` stays gitignored.
+- `app.py`: Streamlit site (leaderboard, QB pages, methodology) reading only from `boards/`. Routes pages via
+  `st.query_params` (`?page=leaderboard|qb|methodology`), not Streamlit's native sidebar multipage nav.
+  Run: `streamlit run app.py`.
 
-## Current model (v2) and what the backtests showed (2022-2025)
+## Current model (v2 adjustment, v3 composite) and what the backtests showed (2022-2025)
 - Target for every test: predicting raw EPA/dropback out of sample. Baseline to beat: raw EPA/dropback.
 - v2 = INT-fault adjustment only, NO garbage-time filter. Slightly beats raw EPA (split-half r .553 vs .546,
   YoY .465 vs .450). Not statistically significant.
@@ -27,26 +34,35 @@ Portfolio project; methodology must be defensible, so every change to the grade 
 - QBs who changed teams (n=14): no metric predicts their next season.
 - Box-score stats tested as additions to v2 (season-grouped CV): only sack rate (+.009) and success rate (+.003)
   helped. Yards, TDs, comp%, ANY/A, CPOE added nothing; adding all of them hurt (-.024). INT rate is ~0 stable.
+- v3 composite (see `qb_backtest.ipynb` section 9): added `success_rate` (EPA>0 share) and `total_sack_rate`,
+  dropped `cpoe` and `fault_sack_rate`. Individually: success rate predicts almost as well as adj EPA itself
+  (split-half r .521, YoY .471); total sack rate clearly beats the FTN-charted QB-fault sack rate (split-half
+  -.363 vs -.142, YoY -.436 vs -.346, bootstrap p(better)=1.0 split-half). Combined composite beats the old
+  composite on both tests (split-half r .505->.538, YoY .457->.493) and now beats raw EPA YoY, though it still
+  trails raw EPA split-half. Chosen post-hoc (after looking at the backtest), like v2 before it; none of the
+  deltas clear statistical significance with 4 seasons of data.
+- Read-progression metrics from FTN `read_thrown` (past-first-read rate, checkdown rate, EPA on 2nd+ read
+  throws) do NOT help: weak and sign-unstable (past-first-read rate is +.05 split-half but -.24 YoY). Not in the
+  grade. Still computed in `qb_table` for QB-page display only (process context, not a grade driver).
 - FTN charting standards drift by season, so all rates are compared within season only.
 - Uncharted plays (FTN lags a day or two) keep raw EPA; `load_season` warns if latest week < 90% charted.
 
 ## Grade composite
-Weights in `CONFIG["weights"]` (z-scores within season, then percentile to 1-100). Live board shrinks each
-component toward league average with k from split-half reliability (QB adj EPA k ~186 dropbacks).
+Weights in `CONFIG["weights"]` (z-scores within season, then percentile to 1-100): `adj_epa_db` .45,
+`success_rate` .20, `int_worthy_rate` -.15, `total_sack_rate` -.15, `rush_epa_db` .10. Live board shrinks each
+component toward league average with k from split-half reliability (QB adj EPA k ~186 dropbacks). `cpoe` and
+`fault_sack_rate` are kept as unshrunk context-only columns on the live board; they no longer drive the grade.
 
-## FTN `read_thrown` codes (observed in 2025; confirm against the nflreadr FTN data dictionary)
-`1` = first read (EPA .31), `2` = second+ read (.17), `CHK` = checkdown (aDOT ~0), `DES` = designed/screen
-(aDOT -3), `SD` = likely off-script/scramble drill, `0` = no read (sacks, throwaways, non-pass plays).
+## FTN `read_thrown` codes
+Confirmed empirically against the actual charting data (sack_rate/comp_rate/aDOT by code), not just the
+nflreadr data dictionary page, because that page has `"0"`/`"1"` backwards from what the data shows:
+`1` = first read (EPA .30, highest volume), `2` = second+ read (.17), `CHK` = checkdown (aDOT ~0),
+`DES` = designed/screen (aDOT -3, no real progression), `SD` = off-script/scramble drill, `0`/NaN = no read
+charted (sacks ~70%, throwaways, non-pass plays; 2022 used NaN instead of `"0"` for this bucket).
 
 ## Next tasks
-1. Add to the grade: success rate, total sack rate (test vs. QB-fault sack rate), and read-progression metrics
-   from `read_thrown` (e.g. share of attempts past the first read, EPA on 2nd+ read throws, checkdown rate).
-   Backtest each one alone and together with the existing harness before locking weights.
-2. Consider fitting composite weights on 2022-2024 and testing on 2025 instead of hand-set weights.
-3. `update_board.py`: weekly live-board refresh only (no backtests), saves `boards/<season>_wk<N>.parquet`.
-4. Streamlit app: leaderboard, QB page (grade trend, components, INT list labeled by fault with play `desc`),
-   methodology page. Show box-score stats for context, but they do not drive the grade.
-5. GitHub Actions cron (Tuesdays) running `update_board.py` and committing the snapshot.
+1. Consider fitting composite weights on 2022-2024 and testing on 2025 instead of hand-set weights.
+2. GitHub Actions cron (Tuesdays) running `update_board.py` and committing the snapshot.
 
 ## Conventions
 - No em dashes in any written output (docs, README, app text).
