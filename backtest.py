@@ -94,3 +94,18 @@ def shrinkage_k(w, metric, n_col="dropbacks"):
     r = _corr(w[f"{metric}_odd"], w[f"{metric}_even"])
     n = (w[f"{n_col}_odd"].mean() + w[f"{n_col}_even"].mean()) / 2
     return float(n * (1 - r) / r) if r > 0 else np.inf
+
+
+def game_pairs_table(db, runs, min_dropbacks_game=10):
+    """Each QB's consecutive-week performances, paired game N vs game N+1 (same season, back to back
+    weeks only -- a bye in between breaks the pair). Reuses the `_odd`/`_even` suffix convention so
+    `shrinkage_k` works unmodified, giving a genuine single-game reliability constant (for the weekly
+    board's shrinkage) instead of an arbitrary "shrink harder" multiplier.
+    """
+    t = q.qb_table(db, runs, by=("season", "week", "id"))
+    t = t[t["dropbacks"] >= min_dropbacks_game].sort_values(["id", "season", "week"]).reset_index(drop=True)
+    g = t.groupby(["id", "season"])
+    nxt = g.shift(-1)
+    consecutive = nxt["week"] == t["week"] + 1
+    paired = pd.concat([t.add_suffix("_odd"), nxt.add_suffix("_even")], axis=1)
+    return paired[consecutive].reset_index(drop=True)

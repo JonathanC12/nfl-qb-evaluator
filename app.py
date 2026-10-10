@@ -61,13 +61,29 @@ def available_weeks(season: int) -> list[int]:
 
 @st.cache_data
 def load_board(season: int, week: int) -> pd.DataFrame:
+    """Cumulative: season-to-date through this week."""
     return pd.read_parquet(BOARDS_DIR / f"{season}_wk{week}.parquet")
 
 
 @st.cache_data
+def load_weekly_board(season: int, week: int) -> pd.DataFrame:
+    """That single week's plays only."""
+    path = BOARDS_DIR / f"{season}_wk{week}_weekly.parquet"
+    return pd.read_parquet(path) if path.exists() else pd.DataFrame()
+
+
+@st.cache_data
 def load_season_trend(season: int) -> pd.DataFrame:
-    """Every week's board stacked, for grade-trend charts."""
+    """Every week's cumulative board stacked, for the season grade-trend line."""
     return pd.concat([load_board(season, wk) for wk in available_weeks(season)], ignore_index=True)
+
+
+@st.cache_data
+def load_weekly_trend(season: int) -> pd.DataFrame:
+    """Every week's single-week board stacked, for the weekly grade dots."""
+    frames = [load_weekly_board(season, wk) for wk in available_weeks(season)]
+    frames = [f for f in frames if len(f)]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 @st.cache_data
@@ -191,6 +207,26 @@ table.board .qb-link:hover {{ text-decoration: underline; }}
   border-radius: 4px; letter-spacing: 0.02em; margin-right: 2px;
 }}
 .table-scroll {{ overflow-x: auto; border-radius: 8px; }}
+table.board td.rank.unqualified {{ color: {GRIDLINE}; }}
+.low-sample {{
+  display: inline-block; font-size: 0.62rem; font-weight: 700; padding: 1px 5px; border-radius: 3px;
+  letter-spacing: 0.03em; color: {INK_MUTED}; background: {GRIDLINE}; margin-left: 6px; vertical-align: 1px;
+}}
+
+/* board header / view toggle */
+.board-head {{ display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap;
+  gap: 8px; margin-bottom: 12px; }}
+.board-head h2 {{ margin: 0; font-size: 1.15rem; }}
+.view-toggle a {{
+  padding: 6px 12px; border-radius: 6px; font-size: 0.82rem; font-weight: 500; color: {INK_SECONDARY};
+  border: 1px solid {BORDER};
+}}
+.view-toggle a.active {{ color: {INK}; font-weight: 600; background: #eef2f9; border-color: #eef2f9; }}
+.view-toggle a:first-child {{ border-radius: 6px 0 0 6px; border-right: none; }}
+.view-toggle a:last-child {{ border-radius: 0 6px 6px 0; }}
+
+.legend {{ display: flex; gap: 16px; font-size: 0.78rem; color: {INK_SECONDARY}; margin: 4px 0 2px 0; }}
+.legend .dot {{ display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }}
 
 /* status pill (interceptions) */
 .pill {{ display: inline-block; font-size: 0.74rem; font-weight: 600; padding: 3px 9px; border-radius: 20px; color: #fff; }}
@@ -257,16 +293,36 @@ def page_leaderboard() -> None:
     weeks = available_weeks(season)
     colors = team_colors()
     params = st.query_params
+    view = params.get("view", "season")
 
     c1, c2, c3 = st.columns([1, 1.3, 1.7])
     with c1:
         week = st.selectbox("Week", weeks, index=len(weeks) - 1, key="wk_select")
-    board = load_board(season, week)
+    board = load_board(season, week) if view == "season" else load_weekly_board(season, week)
+    if board.empty:
+        st.info("No weekly board for this week yet.")
+        return
+    default_min_db = int(board["qualifier_dropbacks"].mode().iat[0]) if len(board) else 0
     with c2:
-        min_db = st.slider("Min dropbacks", 0, int(board["dropbacks"].max()), 60, step=5, key="min_db")
+        min_db = st.slider("Min dropbacks", 0, max(int(board["dropbacks"].max()), default_min_db),
+                            default_min_db, step=1, key=f"min_db_{view}_{week}")
     teams = sorted(board["team"].dropna().unique())
     with c3:
         team_filter = st.multiselect("Team", teams, key="team_filter", placeholder="All teams")
+
+    def toggle(key: str, label: str) -> str:
+        cls = "active" if view == key else ""
+        return f'<a class="{cls}" target="_self" href="?page=leaderboard&view={key}">{label}</a>'
+
+    heading = f"Season through Week {week}" if view == "season" else f"Week {week} only"
+    st.markdown(
+        f'<div class="board-head"><h2>{heading}</h2>'
+        f'<div class="view-toggle">{toggle("season", "Season")}{toggle("weekly", "Weekly")}</div></div>',
+        unsafe_allow_html=True,
+    )
+    if view == "weekly":
+        st.caption("Single-game grades are noisy and shrunk hard toward league average. "
+                   "The season grade (Season tab) is the real ranking.")
 
     df = board[board["dropbacks"] >= min_db].copy()
     if team_filter:
@@ -276,24 +332,32 @@ def page_leaderboard() -> None:
     sort_dir = params.get("dir", "desc")
     sort_map = {"rank": "grade", "qb": "name", "team": "team", **{k: k for k, *_ in LEADERBOARD_COLS}}
     sort_col = sort_map.get(sort_key, "grade")
-    df = df.sort_values(sort_col, ascending=(sort_dir == "asc")).reset_index(drop=True)
+    df = df.sort_values(sort_col, ascending=(sort_dir == "asc"), na_position="last").reset_index(drop=True)
 
-    # percentiles computed within the currently qualifying/filtered set
-    pct = {k: df[k].rank(pct=True) for k, *_ in LEADERBOARD_COLS}
+    # Percentile shading and rank are computed among QUALIFIED rows only (14 dropbacks per team game
+    # played, scaled for byes), so a handful of mop-up dropbacks can't distort the scale.
+    pct = {k: df[k].where(df["qualified"]).rank(pct=True) for k, *_ in LEADERBOARD_COLS}
 
     def header(key: str, label: str, align_left: bool = False) -> str:
         new_dir = "asc" if (sort_key == key and sort_dir == "desc") else "desc"
         cls = ' class="l"' if align_left else ""
-        return (f'<th{cls}><a target="_self" href="?page=leaderboard&sort={key}&dir={new_dir}">'
+        return (f'<th{cls}><a target="_self" href="?page=leaderboard&view={view}&sort={key}&dir={new_dir}">'
                 f'{label}</a></th>')
 
     head_cells = (header("rank", "Rank", True) + header("qb", "QB", True) + header("team", "Team", True)
                   + "".join(header(k, lbl) for k, lbl, *_ in LEADERBOARD_COLS))
 
-    rows = []
+    rows, rank_counter = [], 0
     for i, r in df.iterrows():
-        cells = (f'<td class="rank l">{i + 1}</td>'
-                  f'<td class="name l">{qb_link(r["name"], r["id"], season)}</td>'
+        qualified = bool(r["qualified"])
+        if qualified:
+            rank_counter += 1
+            rank_text = str(rank_counter)
+        else:
+            rank_text = "-"
+        badge = '<span class="low-sample">LOW SAMPLE</span>' if not qualified else ""
+        cells = (f'<td class="rank l{"" if qualified else " unqualified"}">{rank_text}</td>'
+                  f'<td class="name l">{qb_link(r["name"], r["id"], season)}{badge}</td>'
                   f'<td class="l">{team_chip(r["team"], colors)}</td>')
         for key, _, fmt, colorize, lower_good in LEADERBOARD_COLS:
             val = r[key]
@@ -305,21 +369,25 @@ def page_leaderboard() -> None:
 
     st.markdown(f'<div class="table-scroll">{html_table(rows, [head_cells], "board")}</div>',
                 unsafe_allow_html=True)
-    st.caption(f"{len(df)} qualifying quarterbacks, season {season} through week {week}. "
-               "Grade and stats are shrunk toward league average; see Methodology.")
+    st.caption(f"{len(df)} quarterbacks shown, {int(df['qualified'].sum())} qualified "
+               f"(at least {default_min_db} dropbacks). Grade and stats for qualified QBs are shrunk "
+               "toward league average; see Methodology.")
 
 
 # --------------------------------------------------------------------------- #
 # Page: QB
 # --------------------------------------------------------------------------- #
-def trend_svg(weeks: list[int], grades: list[float], width: int = 640, height: int = 150) -> str:
-    pad_l, pad_r, pad_t, pad_b = 8, 54, 16, 22
+WEEKLY_DOT = "#eb6834"  # categorical slot 2 (orange); season line uses POLE_GOOD (blue, slot 1)
+
+
+def trend_svg(all_weeks: list[int], cum_by_week: dict[int, float], weekly_by_week: dict[int, float] | None = None,
+              width: int = 640, height: int = 170) -> str:
+    """Season-to-date grade as a line (+ end label), single-week grades as small dots alongside."""
+    pad_l, pad_r, pad_t, pad_b = 8, 54, 16, 24
     plot_w, plot_h = width - pad_l - pad_r, height - pad_t - pad_b
     lo, hi = 0, 100
-    n = len(weeks)
-
-    def x(i: int) -> float:
-        return pad_l + (plot_w * i / max(n - 1, 1))
+    n = len(all_weeks)
+    week_x = {w: pad_l + (plot_w * i / max(n - 1, 1)) for i, w in enumerate(all_weeks)}
 
     def y(v: float) -> float:
         return pad_t + plot_h * (1 - (v - lo) / (hi - lo))
@@ -330,26 +398,41 @@ def trend_svg(weeks: list[int], grades: list[float], width: int = 640, height: i
         f'<text x="{width - pad_r + 8}" y="{y(v):.1f}" dy="3" font-size="10" fill="{INK_MUTED}">{v}</text>'
         for v in (0, 50, 100)
     )
-    pts = [(x(i), y(g)) for i, g in enumerate(grades)]
-    path = " ".join(f"{'M' if i == 0 else 'L'}{px:.1f},{py:.1f}" for i, (px, py) in enumerate(pts))
-    area = (f"M{pts[0][0]:.1f},{y(lo):.1f} " + " ".join(f"L{px:.1f},{py:.1f}" for px, py in pts)
-            + f" L{pts[-1][0]:.1f},{y(lo):.1f} Z")
     ticks = "".join(
-        f'<text x="{x(i):.1f}" y="{height - 4}" font-size="10" fill="{INK_MUTED}" text-anchor="middle">Wk {w}</text>'
-        for i, w in enumerate(weeks)
+        f'<text x="{week_x[w]:.1f}" y="{height - 4}" font-size="10" fill="{INK_MUTED}" '
+        f'text-anchor="middle">Wk {w}</text>' for w in all_weeks
     )
-    last_x, last_y = pts[-1]
-    blue = f"rgb{POLE_GOOD}"
-    return f"""
-<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" xmlns="http://www.w3.org/2000/svg">
-  {grid}
-  <path d="{area}" fill="{blue}" opacity="0.08"/>
-  <path d="{path}" fill="none" stroke="{blue}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="4.5" fill="{blue}" stroke="{SURFACE}" stroke-width="2"/>
-  <text x="{last_x:.1f}" y="{last_y - 10:.1f}" font-size="12" font-weight="700" fill="{INK}"
-        text-anchor="middle">{grades[-1]:.0f}</text>
-  {ticks}
-</svg>"""
+
+    # No end-of-line value label: the hero number above the chart already shows the latest grade, and
+    # a floating label here would collide with the axis gridline text whenever the grade lands near 0/50/100.
+    cum_weeks = [w for w in all_weeks if w in cum_by_week]
+    line_svg = ""
+    if cum_weeks:
+        blue = f"rgb{POLE_GOOD}"
+        pts = [(week_x[w], y(cum_by_week[w])) for w in cum_weeks]
+        path = " ".join(f"{'M' if i == 0 else 'L'}{px:.1f},{py:.1f}" for i, (px, py) in enumerate(pts))
+        area = (f"M{pts[0][0]:.1f},{y(lo):.1f} " + " ".join(f"L{px:.1f},{py:.1f}" for px, py in pts)
+                + f" L{pts[-1][0]:.1f},{y(lo):.1f} Z")
+        last_x, last_y = pts[-1]
+        line_svg = (f'<path d="{area}" fill="{blue}" opacity="0.08"/>'
+                    f'<path d="{path}" fill="none" stroke="{blue}" stroke-width="2" '
+                    f'stroke-linecap="round" stroke-linejoin="round"/>'
+                    f'<circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="4.5" fill="{blue}" '
+                    f'stroke="{SURFACE}" stroke-width="2"/>')
+
+    dots = ""
+    if weekly_by_week:
+        dots = "".join(
+            f'<circle cx="{week_x[w]:.1f}" cy="{y(g):.1f}" r="4" fill="{WEEKLY_DOT}" '
+            f'stroke="{SURFACE}" stroke-width="1.5"/>'
+            for w, g in weekly_by_week.items() if w in week_x
+        )
+
+    # Joined with no blank lines: a blank line inside raw HTML breaks Streamlit markdown's HTML-block
+    # detection (any piece here can be ""), silently dropping everything after it.
+    body = "".join([grid, line_svg, dots, ticks])
+    return (f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
+            f'xmlns="http://www.w3.org/2000/svg">{body}</svg>')
 
 
 def page_qb() -> None:
@@ -364,17 +447,28 @@ def page_qb() -> None:
 
     qb_id = st.query_params.get("qb")
     if not qb_id or qb_id not in set(latest["id"]):
-        options = latest.sort_values("grade", ascending=False)
+        # Every QB with a dropback gets a page: qualified QBs first (by grade), then everyone else
+        # (by dropbacks), so a low-sample QB is still reachable from the selector.
+        options = latest.sort_values(["qualified", "grade", "dropbacks"], ascending=[False, False, False])
         qb_id = st.selectbox("Choose a QB", options["id"],
                               format_func=lambda i: options.loc[options["id"] == i, "name"].iat[0])
     row = latest[latest["id"] == qb_id].iloc[0]
-    rank = int((latest["grade"] > row["grade"]).sum()) + 1
+    qualified = bool(row["qualified"])
+    if qualified:
+        grade_html = f'<div class="grade-num">{row["grade"]:.0f}</div>'
+        n_qualified = int(latest["qualified"].sum())
+        rank = int((latest.loc[latest["qualified"], "grade"] > row["grade"]).sum()) + 1
+        sub_html = f'<div class="grade-sub">Rank {rank} of {n_qualified} qualified</div>'
+    else:
+        grade_html = '<div class="grade-num" style="font-size:1.8rem">Low sample</div>'
+        need = int(row["qualifier_dropbacks"] - row["dropbacks"])
+        sub_html = f'<div class="grade-sub">Needs {max(need, 0)} more dropbacks to qualify</div>'
 
     st.markdown(f"""
 <div class="qb-hero">
   <div>
-    <div class="grade-num">{row['grade']:.0f}</div>
-    <div class="grade-sub">Rank {rank} of {len(latest)}</div>
+    {grade_html}
+    {sub_html}
   </div>
   <div>
     <h1>{html.escape(row['name'])}</h1>
@@ -384,34 +478,50 @@ def page_qb() -> None:
 </div>
 """, unsafe_allow_html=True)
 
-    trend = load_season_trend(season)
-    qb_hist = trend[trend["id"] == qb_id].sort_values("week")
-    if len(qb_hist) >= 2:
+    cum_trend = load_season_trend(season)
+    cum_hist = cum_trend[(cum_trend["id"] == qb_id) & cum_trend["grade"].notna()].sort_values("week")
+    weekly_trend = load_weekly_trend(season)
+    weekly_hist = weekly_trend[(weekly_trend["id"] == qb_id) & weekly_trend["grade"].notna()].sort_values("week")
+
+    if len(cum_hist) or len(weekly_hist):
         st.markdown('<div class="section-title">Grade by week</div>', unsafe_allow_html=True)
-        st.markdown(trend_svg(qb_hist["week"].tolist(), qb_hist["grade"].tolist()), unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="legend">'
+            f'<span><span class="dot" style="background:rgb{POLE_GOOD}"></span>Season (cumulative)</span>'
+            f'<span><span class="dot" style="background:{WEEKLY_DOT}"></span>Single week</span></div>',
+            unsafe_allow_html=True,
+        )
+        cum_by_week = dict(zip(cum_hist["week"], cum_hist["grade"]))
+        weekly_by_week = dict(zip(weekly_hist["week"], weekly_hist["grade"]))
+        st.markdown(trend_svg(weeks, cum_by_week, weekly_by_week), unsafe_allow_html=True)
+        st.caption("Single-week grades are shrunk hard toward league average and still bounce around a lot. "
+                   "The season (cumulative) line is the real ranking.")
 
     st.markdown('<div class="section-title">Grade components</div>', unsafe_allow_html=True)
-    comp_labels = {
-        "adj_epa_db": "Adj EPA/dropback", "success_rate": "Success rate",
-        "int_worthy_rate": "INT-worthy rate", "total_sack_rate": "Total sack rate",
-        "rush_epa_db": "Rush EPA/dropback",
-    }
-    comp_rows = []
-    for key, weight in q.CONFIG["weights"].items():
-        if key not in latest.columns:
-            continue
-        p = latest[key].rank(pct=True)
-        val_pct = p[latest["id"] == qb_id].iat[0]
-        shown = val_pct if weight >= 0 else 1 - val_pct
-        bg = percentile_bg(shown)
-        comp_rows.append(
-            f'<tr><td>{comp_labels.get(key, key)}</td><td class="num">{weight:+.2f}</td>'
-            f'<td class="num">{row[key]:.3f}</td>'
-            f'<td class="num" style="background:{bg}">{ordinal(round(val_pct * 100))} pct</td></tr>'
-        )
-    st.markdown(html_table(comp_rows, ["<th>Component</th><th class='num'>Weight</th>"
-                                        "<th class='num'>Value</th><th class='num'>Percentile</th>"]),
-                unsafe_allow_html=True)
+    if not qualified:
+        st.markdown("<p>Not enough dropbacks yet to qualify for a graded breakdown.</p>", unsafe_allow_html=True)
+    else:
+        comp_labels = {
+            "adj_epa_db": "Adj EPA/dropback", "success_rate": "Success rate",
+            "int_worthy_rate": "INT-worthy rate", "total_sack_rate": "Total sack rate",
+            "rush_epa_db": "Rush EPA/dropback",
+        }
+        comp_rows = []
+        for key, weight in q.CONFIG["weights"].items():
+            if key not in latest.columns:
+                continue
+            p = latest[key].where(latest["qualified"]).rank(pct=True)
+            val_pct = p[latest["id"] == qb_id].iat[0]
+            shown = val_pct if weight >= 0 else 1 - val_pct
+            bg = percentile_bg(shown)
+            comp_rows.append(
+                f'<tr><td>{comp_labels.get(key, key)}</td><td class="num">{weight:+.2f}</td>'
+                f'<td class="num">{row[key]:.3f}</td>'
+                f'<td class="num" style="background:{bg}">{ordinal(round(val_pct * 100))} pct</td></tr>'
+            )
+        st.markdown(html_table(comp_rows, ["<th>Component</th><th class='num'>Weight</th>"
+                                            "<th class='num'>Value</th><th class='num'>Percentile</th>"]),
+                    unsafe_allow_html=True)
 
     st.markdown('<div class="section-title">Box-score stats (context, not grade drivers)</div>',
                 unsafe_allow_html=True)

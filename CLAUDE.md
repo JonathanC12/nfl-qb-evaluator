@@ -18,12 +18,16 @@ Portfolio project; methodology must be defensible, so every change to the grade 
 - `backtest.py`: split-half (odd vs even weeks) and year-over-year tests, `bootstrap_diff`, `shrinkage_k`.
 - `mixed.py`: ridge-as-random-effects model (QB + defense + offense). Kept for reference; did not help.
 - `update_board.py`: weekly live-board refresh (no backtests). Fits the value models and shrinkage k from
-  2022-2025, applies them to the current season, writes `boards/<season>_wk<N>.parquet` (one per week,
-  season-to-date, for grade-trend charts) and `boards/<season>_interceptions.parquet` (play-level, for QB
-  pages). `boards/` is committed; `data/` stays gitignored.
+  2022-2025, applies them to the current season, and for every week where **every scheduled game is final**
+  (checked via `nflreadpy.load_schedules`; a week in progress is skipped, so the latest board is always a
+  complete week) writes two files: `boards/<season>_wk<N>.parquet` (CUMULATIVE, season-to-date through week N)
+  and `boards/<season>_wk<N>_weekly.parquet` (that week's plays only, shrunk harder with a shrinkage k measured
+  from consecutive-game reliability, not a guessed multiplier -- see `backtest.game_pairs_table`). Also writes
+  `boards/<season>_interceptions.parquet` (play-level, for QB pages). `boards/` is committed; `data/` stays
+  gitignored. Saves EVERY QB with >=1 dropback, no minimum -- see "Qualifier" below.
 - `app.py`: Streamlit site (leaderboard, QB pages, methodology) reading only from `boards/`. Routes pages via
-  `st.query_params` (`?page=leaderboard|qb|methodology`), not Streamlit's native sidebar multipage nav.
-  Run: `streamlit run app.py`.
+  `st.query_params` (`?page=leaderboard|qb|methodology`, `?view=season|weekly` on the leaderboard), not
+  Streamlit's native sidebar multipage nav. Run: `streamlit run app.py`.
 
 ## Current model (v2 adjustment, v3 composite) and what the backtests showed (2022-2025)
 - Target for every test: predicting raw EPA/dropback out of sample. Baseline to beat: raw EPA/dropback.
@@ -52,6 +56,34 @@ Weights in `CONFIG["weights"]` (z-scores within season, then percentile to 1-100
 `success_rate` .20, `int_worthy_rate` -.15, `total_sack_rate` -.15, `rush_epa_db` .10. Live board shrinks each
 component toward league average with k from split-half reliability (QB adj EPA k ~186 dropbacks). `cpoe` and
 `fault_sack_rate` are kept as unshrunk context-only columns on the live board; they no longer drive the grade.
+
+## Qualifier (who gets ranked)
+NFL passer-rating-style rule: a QB qualifies with >= 14 dropbacks per team game played. "Team games played"
+comes from the schedule (`nflreadpy.load_schedules`), not the week number, so a bye week doesn't unfairly
+penalize a team's QB. `update_board.py` computes this per row as `qualifier_dropbacks` (14 x team games played;
+flat 14 on the weekly board, since that's always one game) and a boolean `qualified`, and saves EVERY QB
+regardless -- it does not filter anyone out. All filtering is the app's job (the dropback slider), but
+shrinkage, grading, and the percentile scale are always computed on the qualified population only (in
+`update_board.py`'s `grade_among_qualified`), so a handful of mop-up dropbacks can't skew the scale; unqualified
+QBs keep their raw (unshrunk) stats with grade/composite left `NaN`. The app shows unqualified rows (when the
+slider is low enough) with a "LOW SAMPLE" badge, no rank number, and unshaded cells, never mixed into
+percentiles or ranks.
+
+## Cumulative vs. weekly
+Two different things, both on the leaderboard (a Season/Weekly toggle) and the QB page (a line + dots on the
+same chart):
+- **Season (cumulative)** -- season-to-date through the selected week. This is the real ranking.
+- **Weekly** -- that single week's plays only, shrunk harder (see `update_board.py` above). Single games are
+  noisy; this view exists for context, not for ranking QBs against each other week to week.
+
+## IDs, not names
+Every join, filter, and lookup in this project keys on the GSIS player id (`passer_player_id`, i.e. the `id`
+column `adjust_dropbacks` sets), never on name. nflverse's short display names collide across real players --
+2026 has two different "J.Daniels" (00-0039910 Jayden Daniels, WAS; 00-0041251 Jalon Daniels, TB) who are easy
+to merge by accident if anything groups or joins on name instead of id. `update_board.py` overwrites the
+display `name` column with the full name from `nflreadpy.load_players()` (`gsis_id` -> `display_name`),
+falling back to the pbp short name only if a player isn't found there. The app's QB selector, links, and page
+routing (`?qb=<id>`) are id-keyed throughout; every QB with at least one dropback gets a page, qualified or not.
 
 ## FTN `read_thrown` codes
 Confirmed empirically against the actual charting data (sack_rate/comp_rate/aDOT by code), not just the

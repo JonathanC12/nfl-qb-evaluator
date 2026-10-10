@@ -135,8 +135,16 @@ def _predict(models: dict, key: str, df: pd.DataFrame) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 def adjust_dropbacks(df: pd.DataFrame, models: dict, cfg: dict = CONFIG) -> pd.DataFrame:
     """Return QB dropbacks with raw and fault-adjusted EPA columns."""
-    db = df[(df["qb_dropback"] == 1) & df["qb_epa"].notna() & df["id"].notna()
+    db = df[(df["qb_dropback"] == 1) & df["qb_epa"].notna()
             & df["down"].notna() & (df["qb_spike"] != 1)].copy()
+    # Group/join key everywhere downstream is the GSIS id, never the name (two different players can
+    # share a display name, e.g. 2026's two "J.Daniels": 00-0039910 and 00-0041251). On a scramble
+    # there is no pass, so passer_player_id is null and the QB only appears as rusher_player_id --
+    # fall back to that so scramble dropbacks aren't silently dropped. (Verified this matches
+    # nflverse's own generic "id" column on every 2022-2026 dropback row but a handful of trick-play
+    # scrambles by non-QBs where nflverse's "id" is also null; this fills those in too.)
+    db["id"] = db["passer_player_id"].fillna(db["rusher_player_id"])
+    db = db[db["id"].notna()]
     # Plays FTN has not charted yet (e.g. the latest week) keep their raw EPA: no fault adjustments.
     db["charted"] = db["is_interception_worthy"].notna()
     for c in FTN_BOOL_COLS:
@@ -234,11 +242,18 @@ def qb_table(db: pd.DataFrame, runs: pd.DataFrame | None = None, by=("season", "
     clean = db[~db["garbage"]]
     att = db["pass_attempt"] == 1
 
+    def _mode_or_unknown(s: pd.Series) -> str:
+        # A handful of nflverse rows (trick-play scrambles where even nflverse's own passer/rusher
+        # name field is blank) can leave a group with no non-null value at all; mode() on an all-NaN
+        # series is empty, so .iat[0] would raise. Those rows should be rare enough never to matter.
+        m = s.mode()
+        return m.iat[0] if len(m) else "Unknown"
+
     g_all = db.groupby(by)
     g = clean.groupby(by)
     out = pd.DataFrame({
-        "name": g_all["name"].agg(lambda s: s.mode().iat[0]),
-        "team": g_all["posteam"].agg(lambda s: s.mode().iat[0]),
+        "name": g_all["name"].agg(_mode_or_unknown),
+        "team": g_all["posteam"].agg(_mode_or_unknown),
         "dropbacks": g_all.size(),
         "raw_epa_db": g_all["qb_epa"].mean(),          # the standard public number
         "raw_epa_db_clean": g["qb_epa"].mean(),       # same, garbage time removed
