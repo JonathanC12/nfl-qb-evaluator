@@ -13,6 +13,7 @@ Adjustments to each dropback's EPA (all knobs live in CONFIG):
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -78,6 +79,12 @@ def load_season(season: int, refresh: bool = False) -> pd.DataFrame:
     stale = pbp_path.exists() and not set(PBP_COLS) <= set(pq.read_schema(pbp_path).names)
     if refresh or stale or not pbp_path.exists() or not ftn_path.exists():
         import nflreadpy as nfl
+        if refresh:
+            # Our local parquet isn't the only cache: nflreadpy caches its own HTTP responses
+            # (in-memory by default, filesystem if configured, 24h TTL either way). A plain refetch
+            # can still come back stale for an in-progress season, so clear nflreadpy's cache for
+            # this season specifically before asking it for data.
+            nfl.clear_cache(str(season))
         nfl.load_pbp([season]).select(PBP_COLS).write_parquet(pbp_path)
         nfl.load_ftn_charting([season]).write_parquet(ftn_path)
 
@@ -93,8 +100,13 @@ def load_season(season: int, refresh: bool = False) -> pd.DataFrame:
     db = df[(df["week"] == last) & (df["qb_dropback"] == 1)]
     cov = db["is_interception_worthy"].notna().mean() if len(db) else 1.0
     if cov < 0.9:
-        print(f"[{season}] Week {last}: only {cov:.0%} of dropbacks charted by FTN so far. "
-              f"Uncharted plays use raw EPA; refresh again in a day or two for full adjustments.")
+        msg = (f"[{season}] Week {last}: only {cov:.0%} of dropbacks charted by FTN so far. "
+               f"Uncharted plays use raw EPA; refresh again in a day or two for full adjustments.")
+        print(msg)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            # Surfaces as a visible (non-failing) annotation on the workflow run, not just buried
+            # in the step log -- this is expected on a Tuesday run and not an error.
+            print(f"::warning::{msg}")
     return df
 
 

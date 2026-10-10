@@ -18,16 +18,23 @@ Portfolio project; methodology must be defensible, so every change to the grade 
 - `backtest.py`: split-half (odd vs even weeks) and year-over-year tests, `bootstrap_diff`, `shrinkage_k`.
 - `mixed.py`: ridge-as-random-effects model (QB + defense + offense). Kept for reference; did not help.
 - `update_board.py`: weekly live-board refresh (no backtests). Fits the value models and shrinkage k from
-  2022-2025, applies them to the current season, and for every week where **every scheduled game is final**
-  (checked via `nflreadpy.load_schedules`; a week in progress is skipped, so the latest board is always a
-  complete week) writes two files: `boards/<season>_wk<N>.parquet` (CUMULATIVE, season-to-date through week N)
-  and `boards/<season>_wk<N>_weekly.parquet` (that week's plays only, shrunk harder with a shrinkage k measured
+  2022-2025, applies them to `--season` (default 2026; `boards/` currently also has a full 2025 backfill), and
+  for every week where **every scheduled game is final** (checked via `nflreadpy.load_schedules`; a week in
+  progress is skipped, so the latest board is always a complete week) writes two files:
+  `boards/<season>_wk<N>.parquet` (CUMULATIVE, season-to-date through week N) and
+  `boards/<season>_wk<N>_weekly.parquet` (that week's plays only, shrunk harder with a shrinkage k measured
   from consecutive-game reliability, not a guessed multiplier -- see `backtest.game_pairs_table`). Also writes
-  `boards/<season>_interceptions.parquet` (play-level, for QB pages). `boards/` is committed; `data/` stays
-  gitignored. Saves EVERY QB with >=1 dropback, no minimum -- see "Qualifier" below.
-- `app.py`: Streamlit site (leaderboard, QB pages, methodology) reading only from `boards/`. Routes pages via
-  `st.query_params` (`?page=leaderboard|qb|methodology`, `?view=season|weekly` on the leaderboard), not
-  Streamlit's native sidebar multipage nav. Run: `streamlit run app.py`.
+  `boards/<season>_interceptions.parquet` (play-level, for QB pages) and `boards/team_colors.parquet` (so
+  `app.py` never has to call nflreadpy itself). `boards/` is committed; `data/` stays gitignored. Saves EVERY
+  QB with >=1 dropback, no minimum -- see "Qualifier" below. `--season`'s data is always refetched fresh
+  (`load_season(..., refresh=True)`, which also clears nflreadpy's own response cache for that season, not
+  just our local parquet) since this is meant to be the in-progress season; historical seasons stay cached.
+- `app.py`: Streamlit site (leaderboard, QB pages, methodology) reading only from `boards/` -- no network calls
+  of its own at all, so it can't fail or hang at startup regardless of nflverse's availability. Routes pages
+  via `st.query_params` (`?page=leaderboard|qb|methodology`, `?view=season|weekly&season=<year>` on the
+  leaderboard). Leaderboard has a season selector (any season with boards, not just the current one) alongside
+  the week selector; switching seasons preserves itself across the view-toggle/sort-header links, which are
+  plain `<a>` tags that do a full page navigation, not a Streamlit rerun. Run: `streamlit run app.py`.
 
 ## Current model (v2 adjustment, v3 composite) and what the backtests showed (2022-2025)
 - Target for every test: predicting raw EPA/dropback out of sample. Baseline to beat: raw EPA/dropback.
@@ -77,13 +84,18 @@ same chart):
   noisy; this view exists for context, not for ranking QBs against each other week to week.
 
 ## IDs, not names
-Every join, filter, and lookup in this project keys on the GSIS player id (`passer_player_id`, i.e. the `id`
-column `adjust_dropbacks` sets), never on name. nflverse's short display names collide across real players --
+Every join, filter, and lookup in this project keys on the GSIS player id (the `id` column
+`adjust_dropbacks` sets), never on name. nflverse's short display names collide across real players --
 2026 has two different "J.Daniels" (00-0039910 Jayden Daniels, WAS; 00-0041251 Jalon Daniels, TB) who are easy
-to merge by accident if anything groups or joins on name instead of id. `update_board.py` overwrites the
-display `name` column with the full name from `nflreadpy.load_players()` (`gsis_id` -> `display_name`),
-falling back to the pbp short name only if a player isn't found there. The app's QB selector, links, and page
-routing (`?qb=<id>`) are id-keyed throughout; every QB with at least one dropback gets a page, qualified or not.
+to merge by accident if anything groups or joins on name instead of id. `id = passer_player_id.fillna(rusher_player_id)`,
+**not** `passer_player_id` alone: a scramble has no pass, so `passer_player_id` is null and the QB only shows up
+as `rusher_player_id` -- an earlier version of this missed that and silently dropped ~250 scramble dropbacks a
+season (verified against the pre-bug baseline: Lamar Jackson/Josh Allen/Jalen Hurts/Jayden Daniels dropback
+counts and EPA/db all match exactly after the fix). `update_board.py` also restricts the board to nflreadpy
+position `== "QB"`, so a trick-play pass by a WR doesn't show up as a quarterback, and overwrites the display
+`name` column with the full name from `nflreadpy.load_players()` (`gsis_id` -> `display_name`), falling back to
+the pbp short name only if a player isn't found there. The app's QB selector, links, and page routing
+(`?qb=<id>`) are id-keyed throughout; every QB with at least one dropback gets a page, qualified or not.
 
 ## FTN `read_thrown` codes
 Confirmed empirically against the actual charting data (sack_rate/comp_rate/aDOT by code), not just the
@@ -92,9 +104,23 @@ nflreadr data dictionary page, because that page has `"0"`/`"1"` backwards from 
 `DES` = designed/screen (aDOT -3, no real progression), `SD` = off-script/scramble drill, `0`/NaN = no read
 charted (sacks ~70%, throwaways, non-pass plays; 2022 used NaN instead of `"0"` for this bucket).
 
+## Weekly refresh (production)
+`.github/workflows/update_board.yml` runs `update_board.py` on a schedule and commits `boards/` if it
+changed (`contents: write`, no other permissions needed):
+- **Tuesday 14:00 UTC** -- the normal weekly run, once Monday Night Football is final.
+- **Wednesday 14:00 UTC** -- a second pass that picks up any FTN charting that was still lagging on
+  Tuesday (`load_season` logs a warning, and additionally emits a `::warning::` GitHub Actions
+  annotation, whenever charting for the latest week is under 90%; it does not fail the run).
+- `workflow_dispatch` -- manual trigger from the Actions tab (Actions -> Update QB board -> Run
+  workflow), for testing or an off-schedule refresh.
+
+Deployment: the app is meant to run on Streamlit Community Cloud pointed at this repo with `app.py`
+as the entrypoint. No secrets needed -- it only reads the committed `boards/`. `runtime.txt` pins
+the Python version. Community Cloud redeploys automatically on every push to `main`, so a workflow
+commit to `boards/` is what actually refreshes the live site.
+
 ## Next tasks
 1. Consider fitting composite weights on 2022-2024 and testing on 2025 instead of hand-set weights.
-2. GitHub Actions cron (Tuesdays) running `update_board.py` and committing the snapshot.
 
 ## Conventions
 - No em dashes in any written output (docs, README, app text).

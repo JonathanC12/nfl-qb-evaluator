@@ -105,8 +105,19 @@ def grade_among_qualified(tbl: pd.DataFrame, k_by_metric: dict[str, float]) -> p
     return pd.concat([qualified, unqualified], ignore_index=True)
 
 
+def write_team_colors() -> None:
+    """boards/team_colors.parquet: the app reads this instead of calling nflreadpy itself, so it
+    never needs network access at startup (team colors barely ever change; refreshed each run here
+    for free rather than kept as a separate maintenance step).
+    """
+    import nflreadpy as nfl
+    teams = nfl.load_teams().to_pandas()[["team_abbr", "team_color"]]
+    teams.to_parquet(BOARDS_DIR / "team_colors.parquet", index=False)
+
+
 def update(season: int, qualifier_per_game: int = 14) -> None:
     BOARDS_DIR.mkdir(exist_ok=True)
+    write_team_colors()
 
     # Historical seasons give us the value models (for the INT adjustment) and the shrinkage constants.
     # This is not a backtest: no accuracy scoring, just the inputs the live model needs.

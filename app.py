@@ -1,6 +1,6 @@
 """QB Evaluator web app: leaderboard, QB pages, methodology. Reads only from boards/ (committed
-snapshots written by update_board.py) -- no nflverse network calls except the one-time team-color
-lookup, which is cached.
+snapshots written by update_board.py, including team_colors.parquet) -- no network calls of its
+own at all, nflreadpy included, so it has nothing to fail or hang on at startup.
 
 Run: streamlit run app.py
 """
@@ -94,12 +94,13 @@ def load_interceptions(season: int) -> pd.DataFrame:
 
 @st.cache_data
 def team_colors() -> dict[str, str]:
-    try:
-        import nflreadpy as nfl
-        t = nfl.load_teams().to_pandas()
-        return dict(zip(t["team_abbr"], t["team_color"]))
-    except Exception:
+    """Pre-baked by update_board.py (boards/team_colors.parquet) -- the app makes no network calls
+    of its own, nflreadpy included, so it has nothing to fail or hang on at startup."""
+    path = BOARDS_DIR / "team_colors.parquet"
+    if not path.exists():
         return {}
+    t = pd.read_parquet(path)
+    return dict(zip(t["team_abbr"], t["team_color"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -289,15 +290,27 @@ def page_leaderboard() -> None:
     if not seasons:
         st.warning("No boards found. Run `python update_board.py` first.")
         return
-    season = seasons[-1]
-    weeks = available_weeks(season)
     colors = team_colors()
     params = st.query_params
     view = params.get("view", "season")
 
-    c1, c2, c3 = st.columns([1, 1.3, 1.7])
+    # The view toggle and sort headers below are plain <a> links (a full page navigation, not a
+    # Streamlit rerun), which would otherwise reset the season selectbox back to its default.
+    # Carry the season forward through the query string on every such link.
+    try:
+        default_season_idx = seasons.index(int(params["season"])) if "season" in params else len(seasons) - 1
+    except ValueError:
+        default_season_idx = len(seasons) - 1
+
+    c0, c1, c2, c3 = st.columns([0.9, 0.9, 1.2, 1.6])
+    with c0:
+        season = st.selectbox("Season", seasons, index=default_season_idx, key="season_select")
+    st.query_params["season"] = str(season)
+    weeks = available_weeks(season)
     with c1:
-        week = st.selectbox("Week", weeks, index=len(weeks) - 1, key="wk_select")
+        # Keyed by season so switching seasons resets to that season's latest week instead of
+        # carrying over a week number that might not exist there.
+        week = st.selectbox("Week", weeks, index=len(weeks) - 1, key=f"wk_select_{season}")
     board = load_board(season, week) if view == "season" else load_weekly_board(season, week)
     if board.empty:
         st.info("No weekly board for this week yet.")
@@ -305,16 +318,17 @@ def page_leaderboard() -> None:
     default_min_db = int(board["qualifier_dropbacks"].mode().iat[0]) if len(board) else 0
     with c2:
         min_db = st.slider("Min dropbacks", 0, max(int(board["dropbacks"].max()), default_min_db),
-                            default_min_db, step=1, key=f"min_db_{view}_{week}")
+                            default_min_db, step=1, key=f"min_db_{season}_{view}_{week}")
     teams = sorted(board["team"].dropna().unique())
     with c3:
-        team_filter = st.multiselect("Team", teams, key="team_filter", placeholder="All teams")
+        team_filter = st.multiselect("Team", teams, key=f"team_filter_{season}", placeholder="All teams")
 
     def toggle(key: str, label: str) -> str:
         cls = "active" if view == key else ""
-        return f'<a class="{cls}" target="_self" href="?page=leaderboard&view={key}">{label}</a>'
+        return (f'<a class="{cls}" target="_self" href="?page=leaderboard&season={season}&view={key}">'
+                f'{label}</a>')
 
-    heading = f"Season through Week {week}" if view == "season" else f"Week {week} only"
+    heading = f"{season} season through Week {week}" if view == "season" else f"{season}, Week {week} only"
     st.markdown(
         f'<div class="board-head"><h2>{heading}</h2>'
         f'<div class="view-toggle">{toggle("season", "Season")}{toggle("weekly", "Weekly")}</div></div>',
@@ -341,7 +355,8 @@ def page_leaderboard() -> None:
     def header(key: str, label: str, align_left: bool = False) -> str:
         new_dir = "asc" if (sort_key == key and sort_dir == "desc") else "desc"
         cls = ' class="l"' if align_left else ""
-        return (f'<th{cls}><a target="_self" href="?page=leaderboard&view={view}&sort={key}&dir={new_dir}">'
+        return (f'<th{cls}><a target="_self" '
+                f'href="?page=leaderboard&season={season}&view={view}&sort={key}&dir={new_dir}">'
                 f'{label}</a></th>')
 
     head_cells = (header("rank", "Rank", True) + header("qb", "QB", True) + header("team", "Team", True)
