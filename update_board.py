@@ -18,6 +18,9 @@ For each week, writes two files:
 Only builds weeks where every scheduled game is final (nflreadpy load_schedules): a week in progress
 is never included, so the latest board always reflects a fully-played week.
 
+Cumulative boards also carry box-score season totals (completions, yards, TDs, carries, scrambles...)
+and `boards/<season>_games.parquet` holds a per-game log; both are CONTEXT ONLY and never feed the grade.
+
 Also writes one cumulative `boards/<season>_interceptions.parquet` (play-level, for the QB-page
 interception list), with full display names (not the "J.Daniels"-style short names pbp uses, which
 collide across different players).
@@ -105,6 +108,76 @@ def grade_among_qualified(tbl: pd.DataFrame, k_by_metric: dict[str, float]) -> p
     return pd.concat([qualified, unqualified], ignore_index=True)
 
 
+BOX_COUNT_COLS = ["pass_cmp", "pass_att", "pass_yds", "pass_td", "pass_int", "sacks", "sack_yds",
+                  "rush_att", "rush_yds", "rush_td", "scrambles"]
+
+
+def box_score(pbp: pd.DataFrame, qb_ids: set[str], by: list[str]) -> pd.DataFrame:
+    """Standard box-score stats per QB, grouped by `by` + id. CONTEXT ONLY: nothing here feeds the grade.
+
+    Built from the full play-by-play rather than the graded dropback set, so the definitions match the
+    official box score: spikes count as incomplete attempts, kneels count as carries, and two-point tries
+    and nullified (`no_play`) plays count for nothing. Carries include both scrambles and designed runs;
+    scrambles are also tallied on their own. nflverse marks sacks with pass_attempt=1, so attempts here
+    exclude them explicitly.
+    """
+    plays = pbp[(pbp["two_point_attempt"] != 1)
+                & pbp["play_type"].isin(["pass", "run", "qb_kneel", "qb_spike"])]
+
+    p = plays[plays["passer_player_id"].isin(qb_ids) & (plays["pass_attempt"] == 1)]
+    is_sack, is_cmp = p["sack"] == 1, p["complete_pass"] == 1
+    passing = p.assign(
+        id=p["passer_player_id"],
+        pass_att=~is_sack,
+        pass_cmp=is_cmp,
+        pass_yds=p["yards_gained"].where(is_cmp, 0),
+        pass_td=p["pass_touchdown"] == 1,
+        pass_int=p["interception"] == 1,
+        sacks=is_sack,
+        sack_yds=-p["yards_gained"].where(is_sack, 0),
+    ).groupby(by + ["id"])[["pass_att", "pass_cmp", "pass_yds", "pass_td", "pass_int", "sacks", "sack_yds"]].sum()
+
+    r = plays[plays["rusher_player_id"].isin(qb_ids) & plays["play_type"].isin(["run", "qb_kneel"])]
+    rushing = r.assign(
+        id=r["rusher_player_id"],
+        rush_att=1,
+        rush_yds=r["yards_gained"],
+        rush_td=(r["touchdown"] == 1) & (r["fumble_lost"] != 1),
+        scrambles=r["qb_scramble"] == 1,
+    ).groupby(by + ["id"])[["rush_att", "rush_yds", "rush_td", "scrambles"]].sum()
+
+    out = passing.join(rushing, how="outer").fillna(0).astype(int)[BOX_COUNT_COLS]
+    att = out["pass_att"].where(out["pass_att"] > 0)
+    out["comp_pct"] = out["pass_cmp"] / att
+    out["pass_ypa"] = out["pass_yds"] / att
+    out["box_passer_rating"] = q.passer_rating(out["pass_cmp"], att, out["pass_yds"], out["pass_td"], out["pass_int"])
+    out["rush_ypc"] = out["rush_yds"] / out["rush_att"].where(out["rush_att"] > 0)
+    return out.reset_index()
+
+
+def game_log(pbp: pd.DataFrame, db: pd.DataFrame, weekly_grades: pd.DataFrame, qb_ids: set[str]) -> pd.DataFrame:
+    """One row per QB per game: box score, unshrunk adj EPA/dropback, and that week's single-game grade
+    (NaN when the QB was under the one-game qualifier). Context only, like box_score."""
+    games = box_score(pbp, qb_ids, ["season", "week", "game_id"])
+
+    # Team and opponent from whichever side the QB was on (offense) in that game.
+    qb_plays = pbp.assign(id=pbp["passer_player_id"].fillna(pbp["rusher_player_id"]))
+    qb_plays = qb_plays[qb_plays["id"].isin(qb_ids) & qb_plays["posteam"].notna()]
+    sides = qb_plays.groupby(["game_id", "id"]).agg(
+        team=("posteam", lambda s: s.mode().iat[0]),
+        opponent=("defteam", lambda s: s.mode().iat[0]),
+        home_team=("home_team", "first"),
+    ).reset_index()
+    sides["home"] = sides["team"] == sides["home_team"]
+    games = games.merge(sides.drop(columns="home_team"), on=["game_id", "id"], how="left")
+
+    epa = db.groupby(["game_id", "id"]).agg(dropbacks=("adj_epa", "size"), adj_epa_db=("adj_epa", "mean"))
+    games = games.merge(epa.reset_index(), on=["game_id", "id"], how="left")
+    games["dropbacks"] = games["dropbacks"].fillna(0).astype(int)
+    games = games.merge(weekly_grades[["week", "id", "grade"]], on=["week", "id"], how="left")
+    return games.sort_values(["id", "week"]).reset_index(drop=True)
+
+
 def write_team_colors() -> None:
     """boards/team_colors.parquet: the app reads this instead of calling nflreadpy itself, so it
     never needs network access at startup (team colors barely ever change; refreshed each run here
@@ -157,6 +230,7 @@ def update(season: int, qualifier_per_game: int = 14) -> None:
     live_runs = q.designed_qb_runs(live, set(live_db["id"]))
     live_runs["garbage"] = False
 
+    weekly_grades = []
     for wk in completed_weeks:
         tg = team_games_played[team_games_played["week"] == wk].set_index("team")["games_played"]
 
@@ -168,6 +242,9 @@ def update(season: int, qualifier_per_game: int = 14) -> None:
         cum["qualifier_dropbacks"] = qualifier_per_game * cum["team_games_played"]
         cum["qualified"] = cum["dropbacks"] >= cum["qualifier_dropbacks"]
         cum = grade_among_qualified(cum, k_cumulative)
+        # Box-score season totals ride along on the cumulative board (context only, not grade inputs).
+        box = box_score(live[live["week"] <= wk], qb_ids, ["season"])
+        cum = cum.merge(box, on=["season", "id"], how="left")
         cum.insert(1, "week", wk)
         path = BOARDS_DIR / f"{season}_wk{wk}.parquet"
         cum.to_parquet(path, index=False)
@@ -182,9 +259,17 @@ def update(season: int, qualifier_per_game: int = 14) -> None:
         weekly["qualified"] = weekly["dropbacks"] >= weekly["qualifier_dropbacks"]
         weekly = grade_among_qualified(weekly, k_weekly)
         weekly.insert(1, "week", wk)
+        weekly_grades.append(weekly[["week", "id", "grade"]])
         wpath = BOARDS_DIR / f"{season}_wk{wk}_weekly.parquet"
         weekly.to_parquet(wpath, index=False)
         print(f"wrote {wpath} ({len(weekly)} QBs, {weekly['qualified'].sum()} qualified)")
+
+    games = game_log(live[live["week"] <= max_week], live_db[live_db["week"] <= max_week],
+                     pd.concat(weekly_grades, ignore_index=True), qb_ids)
+    games["name"] = games["id"].map(names)
+    games_path = BOARDS_DIR / f"{season}_games.parquet"
+    games.to_parquet(games_path, index=False)
+    print(f"wrote {games_path} ({len(games)} QB-games)")
 
     ints = live_db[(live_db["interception"] == 1) & (live_db["week"] <= max_week)][INT_COLS]
     ints = ints.rename(columns={"posteam": "team"})

@@ -24,17 +24,44 @@ Portfolio project; methodology must be defensible, so every change to the grade 
   `boards/<season>_wk<N>.parquet` (CUMULATIVE, season-to-date through week N) and
   `boards/<season>_wk<N>_weekly.parquet` (that week's plays only, shrunk harder with a shrinkage k measured
   from consecutive-game reliability, not a guessed multiplier -- see `backtest.game_pairs_table`). Also writes
-  `boards/<season>_interceptions.parquet` (play-level, for QB pages) and `boards/team_colors.parquet` (so
+  `boards/<season>_interceptions.parquet` (play-level, for QB pages), `boards/<season>_games.parquet` (per-QB
+  game log: box score, unshrunk adj EPA/dropback, single-game grade from the weekly board) and
+  `boards/team_colors.parquet` (so
   `app.py` never has to call nflreadpy itself). `boards/` is committed; `data/` stays gitignored. Saves EVERY
   QB with >=1 dropback, no minimum -- see "Qualifier" below. `--season`'s data is always refetched fresh
   (`load_season(..., refresh=True)`, which also clears nflreadpy's own response cache for that season, not
   just our local parquet) since this is meant to be the in-progress season; historical seasons stay cached.
+  Cumulative boards also carry box-score season totals from `box_score()` (completions, attempts, yards, TDs,
+  INTs, sacks, sack yards, passer rating, carries incl. scrambles + designed runs + kneels, scrambles). These
+  are CONTEXT ONLY, never grade inputs, and are built from the full pbp (not the graded dropback set) to match
+  official definitions; validated against `nflreadpy.load_player_stats` for 2025 (counts exact or within 1-2
+  plays league-wide; sack yards stored positive).
+- Known quirk: the value models (`HistGradientBoostingRegressor`, no `random_state`) are not bit-for-bit
+  deterministic, so rerunning `update_board.py` on unchanged data nudges adj EPA in the 3rd-4th decimal and
+  can move a grade by a point or two.
 - `app.py`: Streamlit site (leaderboard, QB pages, methodology) reading only from `boards/` -- no network calls
   of its own at all, so it can't fail or hang at startup regardless of nflverse's availability. Routes pages
   via `st.query_params` (`?page=leaderboard|qb|methodology`, `?view=season|weekly&season=<year>` on the
   leaderboard). Leaderboard has a season selector (any season with boards, not just the current one) alongside
   the week selector; switching seasons preserves itself across the view-toggle/sort-header links, which are
-  plain `<a>` tags that do a full page navigation, not a Streamlit rerun. Run: `streamlit run app.py`.
+  plain `<a>` tags that do a full page navigation, not a Streamlit rerun (`season`/`week` ride along in the
+  query string). QB page has its own QB/Season/Week selectors and shows grade, components, Season stats and
+  Game log (both labeled CONTEXT ONLY), charting context, and interceptions. Run: `streamlit run app.py`.
+
+## Design rules (app)
+- Light theme only, for every visitor: `.streamlit/config.toml` sets `[theme] base = "light"` (a custom theme
+  overrides the viewer's OS dark mode). It is the one tracked file under `.streamlit/` (see `.gitignore`).
+- Layout: fixed dark navy left sidebar (title "QB Evaluator" ~24px bold white + subtitle, then nav with the
+  active item highlighted); light gray page with content on a white card. Under 760px wide the sidebar
+  becomes a navy bar at the top of the card and filters go two per row.
+- Filters are labeled dropdowns (bold dark labels) in a row above the table.
+- Tables: white rows, thin light gray dividers, dark text, bold headers that may wrap, underlined QB links.
+- Shading: ONE warm sequential hue (light peach -> deep orange, deeper = better, `warm_bg`) on key columns
+  only (Grade, Adj EPA/play, Success %, plus percentile/grade cells on the QB page). Sack %, INT-worthy %,
+  Dropbacks stay unshaded. No diverging blue/red. Text stays dark on every shade (worst case 5.5:1, WCAG AA);
+  re-check contrast if the endpoints change. Unqualified rows are never shaded.
+- No gray-on-gray: every control and nav item must be clearly visible on its background.
+- No em dashes in any app text.
 
 ## Current model (v2 adjustment, v3 composite) and what the backtests showed (2022-2025)
 - Target for every test: predicting raw EPA/dropback out of sample. Baseline to beat: raw EPA/dropback.

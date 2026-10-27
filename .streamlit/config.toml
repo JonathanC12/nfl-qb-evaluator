@@ -1,0 +1,10 @@
+# Force the light theme for every visitor, regardless of their OS dark-mode setting: a custom
+# [theme] block replaces Streamlit's automatic light/dark switching, and the settings menu that
+# would let a viewer switch it back is hidden by app.py's CSS.
+[theme]
+base = "light"
+primaryColor = "#14213d"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#eef0f4"
+textColor = "#111827"
+font = "sans serif"

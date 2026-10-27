@@ -3,7 +3,8 @@ data/
 __pycache__/
 .ipynb_checkpoints/
 .claude/
-.streamlit/
+.streamlit/*
+!.streamlit/config.toml
 qb_grades_*.csv
 streamlit.log
 shot_*.png
